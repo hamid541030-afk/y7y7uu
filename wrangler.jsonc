@@ -1,6 +1,6 @@
 {
   "name": "y7y7uu",
-  "main": "src/index.js",
+  "main": "index.js",
   "compatibility_date": "2025-09-01",
   "durable_objects": {
     "bindings": [{ "name": "SESSION", "class_name": "TunnelSession" }]
