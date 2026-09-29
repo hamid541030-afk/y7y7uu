@@ -9,9 +9,9 @@ import { DurableObject } from "cloudflare:workers";
 const CONNECT_TIMEOUT_MS = 8000;  // حداکثر صبر برای باز شدن اتصال TCP
 const WRITE_WAIT_MS = 500;        // بعد از نوشتن داده، چقدر برای جواب صبر کنه
 const POLL_WAIT_MS = 1000;        // برای درخواست خالی (poll)، چقدر منتظر داده بمونه
-const COALESCE_MS = 80;           // بعد از رسیدن اولین داده، کمی صبر تا داده‌ی بیشتری جمع بشه
+const COALESCE_MS = 20;           // بعد از رسیدن اولین داده، کمی صبر تا داده‌ی بیشتری جمع بشه
 const MAX_BUFFER = 2 * 1024 * 1024;   // سقف بافر خوانده‌نشده در هر سشن
-const MAX_REPLY_BYTES = 1024 * 1024;   // سقف حجم جواب هر عملیات
+const MAX_REPLY_BYTES = 400 * 1024;   // سقف حجم جواب هر عملیات
 const SID_RE = /^[0-9a-f-]{36}$/;
 
 // ───── ابزارها ─────
