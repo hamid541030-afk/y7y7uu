@@ -6,7 +6,8 @@ import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
 // ───── تنظیمات قابل تغییر (نسخه‌ی بهینه برای دانلود) ─────
-const CONNECT_TIMEOUT_MS = 8000;      // حداکثر صبر برای باز شدن اتصال TCP
+const CONNECT_TIMEOUT_MS = 5000;      // حداکثر صبر برای باز شدن اتصال TCP
+const IDLE_TIMEOUT_MS = 20000;        // اگه کلاینت این‌قدر به سشن سر نزد، خودکار بسته میشه (صرفه‌جویی در سهمیه‌ی Durable Object)
 const WRITE_WAIT_MS = 500;            // بعد از نوشتن داده، چقدر برای جواب صبر کنه
 const POLL_WAIT_MS = 400;             // برای درخواست خالی (poll)، چقدر منتظر داده بمونه (قبلاً 1000)
 const COALESCE_MS = 100;              // بعد از اولین داده کمی صبر تا جواب پرتر بشه (قبلاً 25)
@@ -164,6 +165,13 @@ export class TunnelSession extends DurableObject {
     this.closed = false;
     this.waiter = null;
     this.drainWaiter = null;
+    this.idleTimer = null;
+  }
+
+  _touch() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.closed) { this.idleTimer = null; return; }
+    this.idleTimer = setTimeout(() => this._teardown(), IDLE_TIMEOUT_MS);
   }
 
   async open(sid, host, port, firstB64) {
@@ -175,6 +183,7 @@ export class TunnelSession extends DurableObject {
       return { sid, e: "connect failed: " + String((err && err.message) || err), eof: true };
     }
     this.writer = this.socket.writable.getWriter();
+    this._touch();
     this._readLoop(); // در پس‌زمینه
 
     if (firstB64) {
@@ -191,6 +200,7 @@ export class TunnelSession extends DurableObject {
     if (!this.socket || this.closed) {
       return { sid, e: "session closed", eof: true };
     }
+    this._touch();
     if (b64) {
       const werr = await this._write(b64);
       if (werr) {
@@ -282,6 +292,7 @@ export class TunnelSession extends DurableObject {
 
   _teardown() {
     this.closed = true;
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
     try { this.writer && this.writer.releaseLock(); } catch (_) {}
     try { this.socket && this.socket.close(); } catch (_) {}
     this.socket = null;
