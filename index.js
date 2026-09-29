@@ -11,7 +11,7 @@ const WRITE_WAIT_MS = 500;        // بعد از نوشتن داده، چقدر 
 const POLL_WAIT_MS = 1000;        // برای درخواست خالی (poll)، چقدر منتظر داده بمونه
 const COALESCE_MS = 25;           // بعد از رسیدن اولین داده، کمی صبر تا داده‌ی بیشتری جمع بشه
 const MAX_BUFFER = 2 * 1024 * 1024;   // سقف بافر خوانده‌نشده در هر سشن
-const MAX_REPLY_BYTES = 500 * 1024;   // سقف حجم جواب هر عملیات
+const MAX_REPLY_BYTES = 512 * 1024;   // سقف حجم جواب هر عملیات
 const SID_RE = /^[0-9a-f-]{36}$/;
 
 // ───── ابزارها ─────
@@ -134,7 +134,12 @@ async function handleOp(env, op) {
     case "data": {
       if (!SID_RE.test(String(op.sid || ""))) return { e: "bad sid", eof: true };
       const stub = env.SESSION.get(env.SESSION.idFromName(op.sid));
-      return await stub.send(op.sid, data);
+      const res = await stub.send(op.sid, data);
+      // اگر سشن از حافظه رفته باشد، به جای خطای 500 پاسخ تمیز می‌دهیم
+      if (res && res.e === "session closed") {
+        return { sid: op.sid, e: "session_expired", eof: true };
+      }
+      return res;
     }
     case "close": {
       if (!SID_RE.test(String(op.sid || ""))) return { sid: op.sid, eof: true };
@@ -247,7 +252,9 @@ export class TunnelSession extends DurableObject {
 
   async _collect(sid, maxWaitMs) {
     if (!this.chunks.length && !this.eof && maxWaitMs > 0) {
-      await Promise.race([new Promise((r) => (this.waiter = r)), sleep(maxWaitMs)]);
+      // ▼▼▼ تغییر اصلی: حداکثر ۲۰۰ میلی‌ثانیه صبر می‌کنیم تا DO از حافظه نره ▼▼▼
+      const waitTime = Math.min(maxWaitMs, 200);
+      await Promise.race([new Promise((r) => (this.waiter = r)), sleep(waitTime)]);
       this.waiter = null;
     }
     if (this.chunks.length && !this.eof) await sleep(COALESCE_MS);
@@ -291,4 +298,4 @@ export class TunnelSession extends DurableObject {
       d();
     }
   }
-}
+            }
