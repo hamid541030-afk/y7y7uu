@@ -1,25 +1,29 @@
-// tunnel-node روی Cloudflare Workers (تلاش برای سازگاری با پروتکل mhrv-rs)
-// پروتکل از روی سمت Apps Script (CodeFull.gs) استنباط شده؛ با tunnel-node واقعی مقایسه نشده.
-// پشتیبانی: TCP (connect / connect_data / data / close)
-// پشتیبانی نمی‌شود: UDP، فشرده‌سازی (zops/zc)
+// tunnel-node روی Cloudflare Workers — نسخه‌ی ۲ (کم‌مصرف + سریع‌تر)
+// تفاوت با نسخه‌ی قبل:
+//  • به‌جای یک Durable Object برای هر اتصال، فقط «یک» Durable Object (hub) همه‌ی اتصال‌ها رو نگه می‌داره.
+//    هر batch = ۱ درخواست Worker + ۱ درخواست DO (نه یکی برای هر عملیات).
+//  • batch به‌محض رسیدن اولین داده برمی‌گرده (به‌جای صبر برای کندترین عملیات).
+//  • اتصال‌های بیکار بعد از ۳۰ ثانیه بسته می‌شن تا مصرف Duration متوقف بشه.
+//  • آدرس‌های خصوصی (مثل 10.x.x.x که DNS فیلترشده می‌ده) سریع رد می‌شن.
+// پشتیبانی: TCP. پشتیبانی نمی‌شود: UDP، فشرده‌سازی (zops/zc)
 import { connect } from "cloudflare:sockets";
 import { DurableObject } from "cloudflare:workers";
 
-// ───── تنظیمات قابل تغییر (نسخه‌ی بهینه برای دانلود) ─────
-const CONNECT_TIMEOUT_MS = 5000;      // حداکثر صبر برای باز شدن اتصال TCP
-const IDLE_TIMEOUT_MS = 20000;        // اگه کلاینت این‌قدر به سشن سر نزد، خودکار بسته میشه (صرفه‌جویی در سهمیه‌ی Durable Object)
-const WRITE_WAIT_MS = 500;            // بعد از نوشتن داده، چقدر برای جواب صبر کنه
-const POLL_WAIT_MS = 400;             // برای درخواست خالی (poll)، چقدر منتظر داده بمونه (قبلاً 1000)
-const COALESCE_MS = 100;              // بعد از اولین داده کمی صبر تا جواب پرتر بشه (قبلاً 25)
-const MAX_BUFFER = 4 * 1024 * 1024;   // سقف بافر خوانده‌نشده در هر سشن (قبلاً 2MB)
-const MAX_REPLY_BYTES = 768 * 1024;   // سقف حجم جواب هر عملیات (قبلاً 512KB)
-                                      // پلن رایگان: اگر خطای CPU دیدی به 512KB برگردون
-                                      // پلن پولی: می‌تونی تا 1MB یا 2MB ببری
+// ───── تنظیمات قابل تغییر ─────
+const CONNECT_TIMEOUT_MS = 5000;   // حداکثر صبر برای باز شدن اتصال TCP
+const WRITE_WAIT_MS = 500;         // بعد از نوشتن داده، حداکثر صبر برای اولین جواب
+const POLL_WAIT_MS = 1000;         // برای درخواست خالی (poll)، حداکثر صبر برای داده
+const COALESCE_MS = 40;            // بعد از اولین داده، کمی صبر تا داده‌ی بیشتری جمع بشه
+const SESSION_IDLE_MS = 30000;     // اتصالی که این‌قدر بدون عملیات بمونه بسته می‌شه
+const SWEEP_MS = 5000;             // هر چند وقت یک‌بار اتصال‌های بیکار چک بشن
+const MAX_SESSIONS = 150;          // حداکثر اتصال هم‌زمان
+const MAX_BUFFER = 512 * 1024;     // سقف بافر خوانده‌نشده‌ی هر اتصال
+const MAX_REPLY_BYTES = 1024 * 1024;   // سقف حجم جواب هر عملیات
+const MAX_BATCH_REPLY = 3 * 1024 * 1024; // سقف حجم کل جواب هر batch
+const HUB_NAME = "hub-v1";
 const SID_RE = /^[0-9a-f-]{36}$/;
 
 // ───── ابزارها ─────
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 function b64ToBytes(s) {
   const bin = atob(s);
   const out = new Uint8Array(bin.length);
@@ -57,6 +61,24 @@ function withTimeout(promise, ms, msg) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// آدرس‌های خصوصی/محلی (مثل جواب DNS فیلترشده: 10.10.34.x) قابل‌اتصال نیستن
+function isPrivateHost(h) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (m) {
+    const a = +m[1], b = +m[2];
+    if (a === 10 || a === 127 || a === 0) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 0) return true; // 192.0.0.0/24 و 192.0.2.0/24
+    if (a >= 224) return true;
+  }
+  const l = h.toLowerCase();
+  return l === "localhost" || l === "::1" || l.endsWith(".local") || l.endsWith(".internal");
+}
+
 const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), {
     status,
@@ -85,139 +107,48 @@ export default {
       return decoy();
     }
 
-    if (path === "/tunnel") {
-      return json(await safeHandle(env, body));
-    }
+    const hub = env.SESSION.get(env.SESSION.idFromName(HUB_NAME));
 
-    // /tunnel/batch
-    if (body.zops) {
-      return json({ e: "compression not supported", code: "UNSUPPORTED_OP" });
+    try {
+      if (path === "/tunnel") {
+        const r = await hub.batch([body]);
+        return json(r[0]);
+      }
+      if (body.zops) {
+        return json({ e: "compression not supported", code: "UNSUPPORTED_OP" });
+      }
+      if (!Array.isArray(body.ops)) return json({ e: "bad request" });
+      return json({ r: await hub.batch(body.ops) });
+    } catch (err) {
+      return json({ e: String((err && err.message) || err) });
     }
-    const ops = Array.isArray(body.ops) ? body.ops : null;
-    if (!ops) return json({ e: "bad request" });
-
-    // عملیات‌های یک sid پشت‌سرهم اجرا می‌شن؛ بقیه موازی
-    const chains = new Map();
-    const results = ops.map((op) => {
-      const key = op && typeof op.sid === "string" ? op.sid : null;
-      if (!key) return safeHandle(env, op);
-      const prev = chains.get(key) || Promise.resolve();
-      const p = prev.then(() => safeHandle(env, op));
-      chains.set(key, p.catch(() => {}));
-      return p;
-    });
-    return json({ r: await Promise.all(results) });
   },
 };
 
-async function safeHandle(env, op) {
-  try {
-    return await handleOp(env, op);
-  } catch (err) {
-    return { e: String((err && err.message) || err) };
-  }
-}
-
-async function handleOp(env, op) {
-  if (!op || typeof op.op !== "string") return { e: "bad op" };
-  const data = op.d ?? op.data ?? "";
-
-  switch (op.op) {
-    case "connect":
-    case "connect_data": {
-      const host = String(op.host || "");
-      const port = Number(op.port);
-      if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
-        return { e: "bad target" };
-      }
-      const sid = crypto.randomUUID();
-      const stub = env.SESSION.get(env.SESSION.idFromName(sid));
-      return await stub.open(sid, host, port, op.op === "connect_data" ? data : "");
-    }
-    case "data": {
-      if (!SID_RE.test(String(op.sid || ""))) return { e: "bad sid", eof: true };
-      const stub = env.SESSION.get(env.SESSION.idFromName(op.sid));
-      return await stub.send(op.sid, data);
-    }
-    case "close": {
-      if (!SID_RE.test(String(op.sid || ""))) return { sid: op.sid, eof: true };
-      const stub = env.SESSION.get(env.SESSION.idFromName(op.sid));
-      return await stub.close(op.sid);
-    }
-    case "udp_open":
-    case "udp_data":
-    case "udp_close":
-      return { e: "udp not supported on worker", code: "UNSUPPORTED_OP" };
-    default:
-      return { e: "unknown tunnel op: " + op.op, code: "UNSUPPORTED_OP" };
-  }
-}
-
-// ───── Durable Object: یک اتصال TCP به ازای هر سشن ─────
-export class TunnelSession extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
+// ───── یک اتصال TCP ─────
+class Session {
+  constructor(hub, host, port) {
+    this.hub = hub;
+    this.host = host;
+    this.port = port;
     this.socket = null;
     this.writer = null;
     this.chunks = [];
     this.buffered = 0;
     this.eof = false;
     this.closed = false;
-    this.waiter = null;
     this.drainWaiter = null;
-    this.idleTimer = null;
+    this.lastActive = Date.now();
   }
 
-  _touch() {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (this.closed) { this.idleTimer = null; return; }
-    this.idleTimer = setTimeout(() => this._teardown(), IDLE_TIMEOUT_MS);
-  }
-
-  async open(sid, host, port, firstB64) {
-    try {
-      this.socket = connect({ hostname: host, port });
-      await withTimeout(this.socket.opened, CONNECT_TIMEOUT_MS, "connect timeout");
-    } catch (err) {
-      this._teardown();
-      return { sid, e: "connect failed: " + String((err && err.message) || err), eof: true };
-    }
+  async open() {
+    this.socket = connect({ hostname: this.host, port: this.port });
+    await withTimeout(this.socket.opened, CONNECT_TIMEOUT_MS, "connect timeout");
     this.writer = this.socket.writable.getWriter();
-    this._touch();
     this._readLoop(); // در پس‌زمینه
-
-    if (firstB64) {
-      const werr = await this._write(firstB64);
-      if (werr) {
-        this._teardown();
-        return { sid, e: werr, eof: true };
-      }
-    }
-    return await this._collect(sid, firstB64 ? WRITE_WAIT_MS : 0);
   }
 
-  async send(sid, b64) {
-    if (!this.socket || this.closed) {
-      return { sid, e: "session closed", eof: true };
-    }
-    this._touch();
-    if (b64) {
-      const werr = await this._write(b64);
-      if (werr) {
-        this._teardown();
-        return { sid, e: werr, eof: true };
-      }
-    }
-    return await this._collect(sid, b64 ? WRITE_WAIT_MS : POLL_WAIT_MS);
-  }
-
-  async close(sid) {
-    this._teardown();
-    return { sid, eof: true };
-  }
-
-  // ── داخلی ──
-  async _write(b64) {
+  async write(b64) {
     try {
       await this.writer.write(b64ToBytes(b64));
       return null;
@@ -235,7 +166,7 @@ export class TunnelSession extends DurableObject {
         if (value && value.byteLength) {
           this.chunks.push(value);
           this.buffered += value.byteLength;
-          this._wake();
+          this.hub._notify();
           while (this.buffered > MAX_BUFFER && !this.closed) {
             await new Promise((r) => (this.drainWaiter = r));
           }
@@ -246,30 +177,28 @@ export class TunnelSession extends DurableObject {
       // اتصال قطع شد
     }
     this.eof = true;
-    this._wake();
+    this.hub._notify();
   }
 
-  _wake() {
-    if (this.waiter) {
-      const w = this.waiter;
-      this.waiter = null;
-      w();
-    }
+  hasData() {
+    return this.chunks.length > 0 || this.eof;
   }
 
-  async _collect(sid, maxWaitMs) {
-    if (!this.chunks.length && !this.eof && maxWaitMs > 0) {
-      await Promise.race([new Promise((r) => (this.waiter = r)), sleep(maxWaitMs)]);
-      this.waiter = null;
-    }
-    if (this.chunks.length && !this.eof) await sleep(COALESCE_MS);
-
+  // حداکثر maxBytes از بافر رو برمی‌داره
+  drain(maxBytes) {
     let total = 0;
     const parts = [];
-    while (this.chunks.length && total < MAX_REPLY_BYTES) {
-      const c = this.chunks.shift();
-      parts.push(c);
-      total += c.byteLength;
+    while (this.chunks.length && total < maxBytes) {
+      const c = this.chunks[0];
+      const take = Math.min(c.byteLength, maxBytes - total);
+      if (take < c.byteLength) {
+        parts.push(c.subarray(0, take));
+        this.chunks[0] = c.subarray(take);
+      } else {
+        parts.push(c);
+        this.chunks.shift();
+      }
+      total += take;
     }
     this.buffered -= total;
     if (this.drainWaiter && this.buffered <= MAX_BUFFER) {
@@ -277,31 +206,223 @@ export class TunnelSession extends DurableObject {
       this.drainWaiter = null;
       d();
     }
-
     const out = new Uint8Array(total);
     let off = 0;
     for (const p of parts) {
       out.set(p, off);
       off += p.byteLength;
     }
-    const eofNow = this.eof && this.chunks.length === 0;
-    const res = { sid, d: bytesToB64(out), eof: eofNow };
-    if (eofNow) this._teardown();
-    return res;
+    return { bytes: out, eofNow: this.eof && this.chunks.length === 0 };
   }
 
-  _teardown() {
+  close() {
     this.closed = true;
-    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
     try { this.writer && this.writer.releaseLock(); } catch (_) {}
     try { this.socket && this.socket.close(); } catch (_) {}
     this.socket = null;
     this.writer = null;
-    this._wake();
     if (this.drainWaiter) {
       const d = this.drainWaiter;
       this.drainWaiter = null;
       d();
     }
+  }
+}
+
+// ───── Durable Object: «hub» همه‌ی اتصال‌ها رو نگه می‌داره ─────
+export class TunnelSession extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sessions = new Map();
+    this.wakers = new Set();
+    this.sweeper = null;
+  }
+
+  async batch(ops) {
+    const n = ops.length;
+    const results = new Array(n);
+    const sids = new Array(n).fill(null);
+    const waits = new Array(n).fill(0);
+
+    // ۱) اجرای عملیات‌ها (هم‌زمان؛ عملیات‌های یک sid پشت‌سرهم)
+    const chains = new Map();
+    const tasks = ops.map((op, i) => {
+      const key = op && typeof op.sid === "string" ? op.sid : null;
+      const run = () => this._apply(op, i, results, sids, waits);
+      if (!key) return run();
+      const prev = chains.get(key) || Promise.resolve();
+      const p = prev.then(run);
+      chains.set(key, p.catch(() => {}));
+      return p;
+    });
+    await Promise.all(tasks);
+
+    // ۲) صبر تا اولین داده (یا پایان مهلت)
+    const waitIdx = [];
+    let budget = 0;
+    for (let i = 0; i < n; i++) {
+      if (sids[i] && waits[i] > 0 && results[i] === undefined) {
+        waitIdx.push(i);
+        budget = Math.max(budget, waits[i]);
+      }
+    }
+    if (waitIdx.length) {
+      const anyReady = () =>
+        waitIdx.some((i) => {
+          const s = this.sessions.get(sids[i]);
+          return !s || s.hasData();
+        });
+      if (!anyReady()) await this._waitUntil(anyReady, budget);
+      if (anyReady()) await sleep(COALESCE_MS);
+    }
+
+    // ۳) جمع‌کردن جواب‌ها
+    let remaining = MAX_BATCH_REPLY;
+    for (let i = 0; i < n; i++) {
+      if (results[i] !== undefined) continue;
+      const sid = sids[i];
+      const s = sid ? this.sessions.get(sid) : null;
+      if (!s) {
+        results[i] = { sid, d: "", eof: true };
+        continue;
+      }
+      const { bytes, eofNow } = s.drain(Math.min(MAX_REPLY_BYTES, Math.max(remaining, 0)));
+      remaining -= bytes.byteLength;
+      results[i] = { sid, d: bytesToB64(bytes), eof: eofNow };
+      if (eofNow) this._drop(sid);
+    }
+    return results;
+  }
+
+  async _apply(op, i, results, sids, waits) {
+    try {
+      if (!op || typeof op.op !== "string") {
+        results[i] = { e: "bad op" };
+        return;
+      }
+      const data = op.d ?? op.data ?? "";
+
+      switch (op.op) {
+        case "connect":
+        case "connect_data": {
+          const host = String(op.host || "");
+          const port = Number(op.port);
+          if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+            results[i] = { e: "bad target" };
+            return;
+          }
+          if (isPrivateHost(host)) {
+            results[i] = { e: "blocked address: " + host, eof: true };
+            return;
+          }
+          if (this.sessions.size >= MAX_SESSIONS) {
+            results[i] = { e: "too many sessions", eof: true };
+            return;
+          }
+          const sid = crypto.randomUUID();
+          const s = new Session(this, host, port);
+          try {
+            await s.open();
+          } catch (err) {
+            s.close();
+            results[i] = { sid, e: "connect failed: " + String((err && err.message) || err), eof: true };
+            return;
+          }
+          this.sessions.set(sid, s);
+          this._ensureSweeper();
+          sids[i] = sid;
+          if (op.op === "connect_data" && data) {
+            const werr = await s.write(data);
+            if (werr) {
+              this._drop(sid);
+              results[i] = { sid, e: werr, eof: true };
+              return;
+            }
+            waits[i] = WRITE_WAIT_MS;
+          }
+          return;
+        }
+        case "data": {
+          const sid = String(op.sid || "");
+          const s = SID_RE.test(sid) ? this.sessions.get(sid) : null;
+          if (!s) {
+            results[i] = { sid, e: "session closed", eof: true };
+            return;
+          }
+          s.lastActive = Date.now();
+          sids[i] = sid;
+          if (data) {
+            const werr = await s.write(data);
+            if (werr) {
+              this._drop(sid);
+              results[i] = { sid, e: werr, eof: true };
+              return;
+            }
+            waits[i] = WRITE_WAIT_MS;
+          } else {
+            waits[i] = POLL_WAIT_MS;
+          }
+          return;
+        }
+        case "close": {
+          const sid = String(op.sid || "");
+          this._drop(sid);
+          results[i] = { sid, eof: true };
+          return;
+        }
+        case "udp_open":
+        case "udp_data":
+        case "udp_close":
+          results[i] = { e: "udp not supported on worker", code: "UNSUPPORTED_OP" };
+          return;
+        default:
+          results[i] = { e: "unknown tunnel op: " + op.op, code: "UNSUPPORTED_OP" };
+      }
+    } catch (err) {
+      results[i] = { e: String((err && err.message) || err) };
+    }
+  }
+
+  _drop(sid) {
+    const s = this.sessions.get(sid);
+    if (s) {
+      s.close();
+      this.sessions.delete(sid);
+    }
+  }
+
+  _notify() {
+    for (const w of [...this.wakers]) w();
+  }
+
+  _waitUntil(pred, ms) {
+    return new Promise((resolve) => {
+      const t = setTimeout(finish, ms);
+      this.wakers.add(check);
+      function check() {
+        if (pred()) finish();
+      }
+      const wakers = this.wakers;
+      function finish() {
+        clearTimeout(t);
+        wakers.delete(check);
+        resolve();
+      }
+    });
+  }
+
+  // اتصال‌های بیکار رو می‌بنده؛ وقتی هیچ اتصالی نمونده متوقف می‌شه تا DO بتونه آزاد بشه
+  _ensureSweeper() {
+    if (this.sweeper) return;
+    this.sweeper = setInterval(() => {
+      const now = Date.now();
+      for (const [sid, s] of this.sessions) {
+        if (now - s.lastActive > SESSION_IDLE_MS) this._drop(sid);
+      }
+      if (this.sessions.size === 0) {
+        clearInterval(this.sweeper);
+        this.sweeper = null;
+      }
+    }, SWEEP_MS);
   }
 }
