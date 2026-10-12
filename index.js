@@ -1,9 +1,10 @@
-// tunnel-node روی Cloudflare Workers — نسخه‌ی ۲ (کم‌مصرف + سریع‌تر)
+// tunnel-node روی Cloudflare Workers — نسخه‌ی ۲.۲ (کم‌مصرف + کم‌لگ)
 // تفاوت با نسخه‌ی قبل:
 //  • به‌جای یک Durable Object برای هر اتصال، فقط «یک» Durable Object (hub) همه‌ی اتصال‌ها رو نگه می‌داره.
 //    هر batch = ۱ درخواست Worker + ۱ درخواست DO (نه یکی برای هر عملیات).
 //  • batch بعد از اولین داده فقط تا وقتی داده‌ی تازه می‌رسه صبر می‌کنه (سریع برای پاسخ کوچیک، پر برای دانلود).
 //  • اتصال‌های بیکار بعد از ۳۰ ثانیه بسته می‌شن تا مصرف Duration متوقف بشه.
+//  • (۲.۲) اتصال کند به یه سایت، بقیه‌ی batch رو معطل نمی‌کنه؛ poll بیکار موقع استفاده کوتاه‌تره.
 //  • آدرس‌های خصوصی (مثل 10.x.x.x که DNS فیلترشده می‌ده) سریع رد می‌شن.
 // پشتیبانی: TCP. پشتیبانی نمی‌شود: UDP، فشرده‌سازی (zops/zc)
 import { connect } from "cloudflare:sockets";
@@ -11,8 +12,12 @@ import { DurableObject } from "cloudflare:workers";
 
 // ───── تنظیمات قابل تغییر ─────
 const CONNECT_TIMEOUT_MS = 5000;   // حداکثر صبر برای باز شدن اتصال TCP
-const WRITE_WAIT_MS = 500;         // بعد از نوشتن داده، حداکثر صبر برای اولین جواب
-const POLL_WAIT_MS = 1000;         // برای درخواست خالی (poll)، حداکثر صبر برای داده
+const WRITE_WAIT_MS = 800;         // بعد از نوشتن داده، حداکثر صبر برای اولین جواب
+const POLL_ACTIVE_WAIT_MS = 300;   // poll خالی وقتی تازه ترافیک بوده: کوتاه (لگ کمتر)
+const POLL_IDLE_WAIT_MS = 1500;    // poll خالی وقتی چند ثانیه ترافیکی نبوده: بلند (درخواست کمتر)
+const ACTIVE_WINDOW_MS = 4000;     // «تازه ترافیک بوده» یعنی در همین چند میلی‌ثانیه اخیر
+const CONNECT_SOFT_MS = 1200;      // اتصال کندتر از این batch رو معطل نمی‌کنه؛ پشت‌صحنه ادامه می‌ده
+const SLOW_BATCH_LOG_MS = 1800;    // batchهای کندتر از این توی لاگ Cloudflare ثبت می‌شن
 const QUIET_MS = 60;               // بعد از اولین داده، تا وقتی داده‌ی تازه می‌رسه صبر می‌کنه (هر بار این‌قدر)
 const MAX_COALESCE_MS = 350;       // سقف این صبر؛ هرچی بیشتر باشه داده‌ی بیشتری با هر رفت‌وبرگشت می‌ره
 const SESSION_IDLE_MS = 30000;     // اتصالی که این‌قدر بدون عملیات بمونه بسته می‌شه
@@ -64,6 +69,13 @@ function withTimeout(promise, ms, msg) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// منتظر p می‌مونه ولی بیشتر از ms نه (بدون خطا)
+function softWait(p, ms) {
+  let t;
+  const timer = new Promise((r) => (t = setTimeout(r, ms)));
+  return Promise.race([p, timer]).finally(() => clearTimeout(t));
+}
 
 // آدرس‌های خصوصی/محلی (مثل جواب DNS فیلترشده: 10.10.34.x) قابل‌اتصال نیستن
 function isPrivateHost(h) {
@@ -141,22 +153,55 @@ class Session {
     this.closed = false;
     this.drainWaiter = null;
     this.lastActive = Date.now();
+    this.opening = null;
+    this.isOpen = false;
+    this.err = null;
+    this.queue = []; // نوشته‌هایی که قبل از باز شدن اتصال رسیدن
   }
 
-  async open() {
-    this.socket = connect({ hostname: this.host, port: this.port });
-    await withTimeout(this.socket.opened, CONNECT_TIMEOUT_MS, "connect timeout");
-    this.writer = this.socket.writable.getWriter();
-    this._readLoop(); // در پس‌زمینه
+  // اتصال رو (پشت‌صحنه) باز می‌کنه و داده‌ی اول رو می‌نویسه. خطا توی this.err می‌مونه.
+  start(firstB64) {
+    this.opening = (async () => {
+      this.socket = connect({ hostname: this.host, port: this.port });
+      await withTimeout(this.socket.opened, CONNECT_TIMEOUT_MS, "connect timeout");
+      this.writer = this.socket.writable.getWriter();
+      this._readLoop(); // در پس‌زمینه
+      if (firstB64) {
+        const werr = await this._rawWrite(firstB64);
+        if (werr) throw new Error(werr);
+      }
+      while (this.queue.length) {
+        const werr = await this._rawWrite(this.queue.shift());
+        if (werr) throw new Error(werr);
+      }
+      this.isOpen = true;
+    })().catch((err) => {
+      this.err = "connect failed: " + String((err && err.message) || err);
+      this.eof = true;
+      try { this.socket && this.socket.close(); } catch (_) {}
+      this.hub._notify();
+    });
+    return this.opening;
   }
 
-  async write(b64) {
+  async _rawWrite(b64) {
     try {
       await this.writer.write(b64ToBytes(b64));
       return null;
     } catch (err) {
       return "write failed: " + String((err && err.message) || err);
     }
+  }
+
+  async write(b64) {
+    if (this.err) return this.err;
+    if (this.closed) return "session closed";
+    if (!this.isOpen) {
+      // هنوز باز نشده: توی صف می‌ذاریم تا بعد از باز شدن به‌ترتیب نوشته بشه (batch معطل نمی‌شه)
+      this.queue.push(b64);
+      return null;
+    }
+    return this._rawWrite(b64);
   }
 
   async _readLoop() {
@@ -243,6 +288,7 @@ export class TunnelSession extends DurableObject {
     this.wakers = new Set();
     this.sweeper = null;
     this.total = 0; // مجموع بایت‌های خوانده‌نشده‌ی همه‌ی اتصال‌ها
+    this.lastActivity = 0; // آخرین زمانی که ترافیک واقعی بود
   }
 
   _wakeDrainers() {
@@ -256,6 +302,7 @@ export class TunnelSession extends DurableObject {
   }
 
   async batch(ops) {
+    const t0 = Date.now();
     const n = ops.length;
     const results = new Array(n);
     const sids = new Array(n).fill(null);
@@ -273,6 +320,7 @@ export class TunnelSession extends DurableObject {
       return p;
     });
     await Promise.all(tasks);
+    const tApplied = Date.now();
 
     // ۲) صبر تا اولین داده (یا پایان مهلت)
     const waitIdx = [];
@@ -309,6 +357,8 @@ export class TunnelSession extends DurableObject {
       }
     }
 
+    const tWaited = Date.now();
+
     // ۳) جمع‌کردن جواب‌ها
     let remaining = MAX_BATCH_REPLY;
     for (let i = 0; i < n; i++) {
@@ -321,8 +371,20 @@ export class TunnelSession extends DurableObject {
       }
       const { bytes, eofNow } = s.drain(Math.min(MAX_REPLY_BYTES, Math.max(remaining, 0)));
       remaining -= bytes.byteLength;
-      results[i] = { sid, d: bytesToB64(bytes), eof: eofNow };
+      if (bytes.byteLength) this.lastActivity = Date.now();
+      const res = { sid, d: bytesToB64(bytes), eof: eofNow };
+      if (s.err) res.e = s.err;
+      results[i] = res;
       if (eofNow) this._drop(sid);
+    }
+
+    const tEnd = Date.now();
+    if (tEnd - t0 > SLOW_BATCH_LOG_MS) {
+      console.log(JSON.stringify({
+        slowBatch: true, ops: n, totalMs: tEnd - t0, applyMs: tApplied - t0,
+        waitMs: tWaited - tApplied, collectMs: tEnd - tWaited,
+        sessions: this.sessions.size, bufferedKB: Math.round(this.total / 1024),
+      }));
     }
     return results;
   }
@@ -354,25 +416,19 @@ export class TunnelSession extends DurableObject {
           }
           const sid = crypto.randomUUID();
           const s = new Session(this, host, port);
-          try {
-            await s.open();
-          } catch (err) {
-            s.close();
-            results[i] = { sid, e: "connect failed: " + String((err && err.message) || err), eof: true };
-            return;
-          }
+          const first = op.op === "connect_data" ? data : "";
           this.sessions.set(sid, s);
           this._ensureSweeper();
           sids[i] = sid;
-          if (op.op === "connect_data" && data) {
-            const werr = await s.write(data);
-            if (werr) {
-              this._drop(sid);
-              results[i] = { sid, e: werr, eof: true };
-              return;
-            }
-            waits[i] = WRITE_WAIT_MS;
+          this.lastActivity = Date.now();
+          // اتصال کند بقیه‌ی batch رو معطل نمی‌کنه: بعد از CONNECT_SOFT_MS بدون منتظر موندن ادامه می‌ده
+          await softWait(s.start(first), CONNECT_SOFT_MS);
+          if (s.err) {
+            results[i] = { sid, e: s.err, eof: true };
+            this._drop(sid);
+            return;
           }
+          if (first && s.isOpen) waits[i] = WRITE_WAIT_MS;
           return;
         }
         case "data": {
@@ -385,15 +441,19 @@ export class TunnelSession extends DurableObject {
           s.lastActive = Date.now();
           sids[i] = sid;
           if (data) {
+            this.lastActivity = Date.now();
             const werr = await s.write(data);
             if (werr) {
               this._drop(sid);
               results[i] = { sid, e: werr, eof: true };
               return;
             }
-            waits[i] = WRITE_WAIT_MS;
+            waits[i] = s.isOpen ? WRITE_WAIT_MS : 0;
           } else {
-            waits[i] = POLL_WAIT_MS;
+            waits[i] =
+              Date.now() - this.lastActivity < ACTIVE_WINDOW_MS
+                ? POLL_ACTIVE_WAIT_MS
+                : POLL_IDLE_WAIT_MS;
           }
           return;
         }
