@@ -2,7 +2,7 @@
 // تفاوت با نسخه‌ی قبل:
 //  • به‌جای یک Durable Object برای هر اتصال، فقط «یک» Durable Object (hub) همه‌ی اتصال‌ها رو نگه می‌داره.
 //    هر batch = ۱ درخواست Worker + ۱ درخواست DO (نه یکی برای هر عملیات).
-//  • batch به‌محض رسیدن اولین داده برمی‌گرده (به‌جای صبر برای کندترین عملیات).
+//  • batch بعد از اولین داده فقط تا وقتی داده‌ی تازه می‌رسه صبر می‌کنه (سریع برای پاسخ کوچیک، پر برای دانلود).
 //  • اتصال‌های بیکار بعد از ۳۰ ثانیه بسته می‌شن تا مصرف Duration متوقف بشه.
 //  • آدرس‌های خصوصی (مثل 10.x.x.x که DNS فیلترشده می‌ده) سریع رد می‌شن.
 // پشتیبانی: TCP. پشتیبانی نمی‌شود: UDP، فشرده‌سازی (zops/zc)
@@ -13,13 +13,15 @@ import { DurableObject } from "cloudflare:workers";
 const CONNECT_TIMEOUT_MS = 5000;   // حداکثر صبر برای باز شدن اتصال TCP
 const WRITE_WAIT_MS = 500;         // بعد از نوشتن داده، حداکثر صبر برای اولین جواب
 const POLL_WAIT_MS = 1000;         // برای درخواست خالی (poll)، حداکثر صبر برای داده
-const COALESCE_MS = 40;            // بعد از اولین داده، کمی صبر تا داده‌ی بیشتری جمع بشه
+const QUIET_MS = 60;               // بعد از اولین داده، تا وقتی داده‌ی تازه می‌رسه صبر می‌کنه (هر بار این‌قدر)
+const MAX_COALESCE_MS = 350;       // سقف این صبر؛ هرچی بیشتر باشه داده‌ی بیشتری با هر رفت‌وبرگشت می‌ره
 const SESSION_IDLE_MS = 30000;     // اتصالی که این‌قدر بدون عملیات بمونه بسته می‌شه
 const SWEEP_MS = 5000;             // هر چند وقت یک‌بار اتصال‌های بیکار چک بشن
 const MAX_SESSIONS = 150;          // حداکثر اتصال هم‌زمان
-const MAX_BUFFER = 512 * 1024;     // سقف بافر خوانده‌نشده‌ی هر اتصال
+const MAX_BUFFER = 2 * 1024 * 1024;        // سقف بافر خوانده‌نشده‌ی هر اتصال
+const MAX_TOTAL_BUFFER = 40 * 1024 * 1024; // سقف بافر کل اتصال‌ها (محافظ حافظه)
 const MAX_REPLY_BYTES = 1024 * 1024;   // سقف حجم جواب هر عملیات
-const MAX_BATCH_REPLY = 3 * 1024 * 1024; // سقف حجم کل جواب هر batch
+const MAX_BATCH_REPLY = 6 * 1024 * 1024; // سقف حجم کل جواب هر batch
 const HUB_NAME = "hub-v1";
 const SID_RE = /^[0-9a-f-]{36}$/;
 
@@ -166,8 +168,12 @@ class Session {
         if (value && value.byteLength) {
           this.chunks.push(value);
           this.buffered += value.byteLength;
+          this.hub.total += value.byteLength;
           this.hub._notify();
-          while (this.buffered > MAX_BUFFER && !this.closed) {
+          while (
+            (this.buffered > MAX_BUFFER || this.hub.total > MAX_TOTAL_BUFFER) &&
+            !this.closed
+          ) {
             await new Promise((r) => (this.drainWaiter = r));
           }
         }
@@ -201,11 +207,8 @@ class Session {
       total += take;
     }
     this.buffered -= total;
-    if (this.drainWaiter && this.buffered <= MAX_BUFFER) {
-      const d = this.drainWaiter;
-      this.drainWaiter = null;
-      d();
-    }
+    this.hub.total -= total;
+    this.hub._wakeDrainers();
     const out = new Uint8Array(total);
     let off = 0;
     for (const p of parts) {
@@ -217,6 +220,9 @@ class Session {
 
   close() {
     this.closed = true;
+    this.hub.total -= this.buffered;
+    this.buffered = 0;
+    this.chunks = [];
     try { this.writer && this.writer.releaseLock(); } catch (_) {}
     try { this.socket && this.socket.close(); } catch (_) {}
     this.socket = null;
@@ -236,6 +242,17 @@ export class TunnelSession extends DurableObject {
     this.sessions = new Map();
     this.wakers = new Set();
     this.sweeper = null;
+    this.total = 0; // مجموع بایت‌های خوانده‌نشده‌ی همه‌ی اتصال‌ها
+  }
+
+  _wakeDrainers() {
+    for (const s of this.sessions.values()) {
+      if (s.drainWaiter && s.buffered <= MAX_BUFFER && this.total <= MAX_TOTAL_BUFFER) {
+        const d = s.drainWaiter;
+        s.drainWaiter = null;
+        d();
+      }
+    }
   }
 
   async batch(ops) {
@@ -273,7 +290,23 @@ export class TunnelSession extends DurableObject {
           return !s || s.hasData();
         });
       if (!anyReady()) await this._waitUntil(anyReady, budget);
-      if (anyReady()) await sleep(COALESCE_MS);
+      if (anyReady()) {
+        // تا وقتی داده‌ی تازه می‌رسه صبر کن (حداکثر MAX_COALESCE_MS) تا هر رفت‌وبرگشت پرتر بره
+        const sizeNow = () =>
+          waitIdx.reduce((a, i) => {
+            const s = this.sessions.get(sids[i]);
+            return a + (s ? s.buffered : 0);
+          }, 0);
+        const start = Date.now();
+        let last = -1;
+        for (;;) {
+          const cur = sizeNow();
+          if (cur === last || cur >= MAX_BATCH_REPLY) break;
+          last = cur;
+          if (Date.now() - start >= MAX_COALESCE_MS) break;
+          await sleep(QUIET_MS);
+        }
+      }
     }
 
     // ۳) جمع‌کردن جواب‌ها
